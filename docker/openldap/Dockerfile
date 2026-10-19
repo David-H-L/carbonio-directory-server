@@ -59,9 +59,10 @@ RUN apt-get update \
  && cp /etc/passwd /etc/group /staging/etc/ \
  && rm -rf /var/lib/apt/lists/*
 
+# --- ETAPA FINAL OPTIMIZADA PARA OPENSHIFT ---
 FROM --platform=$TARGETPLATFORM docker.io/library/ubuntu:jammy
 
-# Copy extracted openldap tree — no RUN needed, no QEMU required
+# Copiar el árbol extraído
 COPY --from=openldap-installer /staging/opt /opt
 COPY --from=openldap-installer /staging/usr/local/lib /usr/local/lib/
 COPY --from=openldap-installer /staging/usr/bin/openssl /usr/bin/openssl
@@ -79,4 +80,15 @@ COPY docker/openldap/ldap-utils/ /ldap-utils/
 COPY --from=build /build/src/ldap/generated/ /opt/zextras/common/etc/openldap/zimbra/
 
 COPY docker/openldap/entrypoint.sh /entrypoint.sh
+
+# [CAMBIO OPENSHIFT]: Configurar permisos para que cualquier UID aleatorio asignado por OpenShift
+# (que siempre pertenece al grupo GID 0 / root) pueda escribir en los directorios críticos de OpenLDAP.
+RUN chmod -R g=u /opt/zextras/common/etc/openldap \
+                 /var/lib/ldap \
+                 /var/run/openldap 2>/dev/null || true
+
+# [CAMBIO OPENSHIFT]: Declarar explícitamente la ejecución con un usuario no raíz (no-root). 
+# El UID 1001500000 es una buena práctica ya que cae dentro del rango por defecto de los SCC de OpenShift.
+USER 1001500000
+
 ENTRYPOINT ["/entrypoint.sh"]
