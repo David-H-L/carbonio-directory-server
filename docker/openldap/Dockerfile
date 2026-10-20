@@ -1,35 +1,61 @@
-FROM --platform=$BUILDPLATFORM docker.io/library/maven:3-eclipse-temurin-21-alpine AS build
+
+# ==========================================
+# ETAPA 1: Compilar los esquemas de Carbonio
+# ==========================================
+
+FROM --platform=$BUILDPLATFORM \
+  docker.io/library/maven:3-eclipse-temurin-21-alpine AS build
+
 RUN apk add --no-cache git
+
 WORKDIR /build
 
-COPY .git                             .git
-
+COPY .git .git
 COPY pom.xml pom.xml
 COPY src src
 
-RUN --mount=type=cache,target=/root/.m2 mvn clean install -DskipTests
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn clean install -DskipTests
 
-FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:jammy AS openldap-installer
 
-ARG TARGETARCH
+# ==========================================
+# ETAPA 2: Obtener paquetes Carbonio LDAP
+# ==========================================
+
+FROM --platform=$BUILDPLATFORM \
+  docker.io/library/ubuntu:jammy AS openldap-installer
+
+ARG TARGETARCH=amd64
 ARG BUILDARCH=amd64
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates openssl \
- # Cross-arch setup when TARGETARCH != BUILDARCH
- && if [ "${TARGETARCH}" != "${BUILDARCH}" ]; then \
-      dpkg --add-architecture ${TARGETARCH} \
-      && sed -i 's|^deb |deb [arch='"${BUILDARCH}"'] |' /etc/apt/sources.list \
-      && printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: jammy jammy-updates jammy-security\nComponents: main restricted universe multiverse\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' "${TARGETARCH}" \
-         > /etc/apt/sources.list.d/ports-${TARGETARCH}.sources; \
-    fi \
- # Add zextras devel repo (Nexus mirror of ubuntu-devel)
- && printf 'deb [arch=%s trusted=yes] https://repo.zextras.tools/repository/ubuntu-devel-jammy jammy main\n' "${TARGETARCH}" \
-    > /etc/apt/sources.list.d/zextras.list \
- && apt-get update \
- # Download only the packages needed to run slapd — no dep resolution, no carbonio-core
- && mkdir -p /staging /tmp/debs && cd /tmp/debs \
- && apt-get download \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      openssl \
+      gnupg && \
+    rm -rf /var/lib/apt/lists/*
+
+# Arquitectura adicional cuando corresponda
+RUN if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+      dpkg --add-architecture "$TARGETARCH"; \
+      printf \
+        'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: jammy jammy-updates jammy-security\nComponents: main restricted universe multiverse\nArchitectures: %s\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+        "$TARGETARCH" \
+        > /etc/apt/sources.list.d/ports-target.sources; \
+    fi
+
+# Repositorio de desarrollo de Zextras.
+# SOLO PARA LABORATORIO.
+# Antes de producción: verificar firma y fijar versiones.
+RUN printf \
+    'deb [arch=%s trusted=yes] https://repo.zextras.tools/repository/ubuntu-devel-jammy jammy main\n' \
+    "$TARGETARCH" \
+    > /etc/apt/sources.list.d/zextras.list
+
+RUN apt-get update && \
+    mkdir -p /staging /tmp/debs && \
+    cd /tmp/debs && \
+    apt-get download \
       carbonio-openldap:${TARGETARCH} \
       carbonio-openssl:${TARGETARCH} \
       carbonio-cyrus-sasl:${TARGETARCH} \
@@ -40,55 +66,109 @@ RUN apt-get update \
       netcat-openbsd:${TARGETARCH} \
       libbsd0:${TARGETARCH} \
       libmd0:${TARGETARCH} \
-      openssl:${TARGETARCH} \
- # Extract all debs with dpkg -x — no postinst scripts run
- && for deb in /tmp/debs/*.deb; do dpkg -x "$deb" /staging; done \
- && rm -rf /tmp/debs \
- # Collect arch-specific libs into /staging/usr/local/lib for arch-independent COPY
- && mkdir -p /staging/usr/local/lib \
- && find /staging/lib /staging/usr/lib -name '*.so*' -not -path '*/opt/*' \
-    -exec cp -P {} /staging/usr/local/lib/ \; 2>/dev/null || true \
- # Fix netcat: binary may land in bin/ or usr/bin/ depending on arch — normalise to bin/
- && find /staging/bin /staging/usr/bin -name 'nc.openbsd' -exec cp {} /staging/bin/nc.openbsd \; 2>/dev/null || true \
- && ln -sf nc.openbsd /staging/bin/netcat \
- && ln -sf nc.openbsd /staging/bin/nc \
- # Pre-create zextras user/group entries for the final stage (passwd/group only)
- && groupadd -r zextras \
- && useradd -r -g zextras -d /opt/zextras -s /bin/bash zextras \
- && mkdir -p /staging/etc \
- && cp /etc/passwd /etc/group /staging/etc/ \
- && rm -rf /var/lib/apt/lists/*
+      openssl:${TARGETARCH} && \
+    for deb in /tmp/debs/*.deb; do \
+      dpkg -x "$deb" /staging; \
+    done && \
+    mkdir -p /staging/usr/local/lib && \
+    find /staging/lib /staging/usr/lib \
+      -name '*.so*' -not -path '*/opt/*' \
+      -exec cp -P {} /staging/usr/local/lib/ \; && \
+    rm -rf /tmp/debs /var/lib/apt/lists/*
 
-# --- ETAPA FINAL OPTIMIZADA PARA OPENSHIFT ---
-FROM --platform=$TARGETPLATFORM docker.io/library/ubuntu:jammy
+# ==========================================
+# ETAPA 3: Imagen final para OpenShift
+# ==========================================
 
-# Copiar el árbol extraído
+FROM --platform=$TARGETPLATFORM \
+  docker.io/library/ubuntu:jammy
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Utilidades necesarias en tiempo de ejecución.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      openssl \
+      netcat-openbsd \
+      libcap2-bin \
+      libltdl7 \
+      libsystemd0 \
+      libbsd0 \
+      libmd0 \
+      libsodium23 \
+      procps && \
+    rm -rf /var/lib/apt/lists/*
+
+# Archivos extraídos de Carbonio OpenLDAP
 COPY --from=openldap-installer /staging/opt /opt
-COPY --from=openldap-installer /staging/usr/local/lib /usr/local/lib/
-COPY --from=openldap-installer /staging/usr/bin/openssl /usr/bin/openssl
-COPY --from=openldap-installer /staging/bin /bin/
-COPY --from=openldap-installer /staging/sbin /sbin/
-COPY --from=openldap-installer /staging/etc/passwd /etc/passwd
-COPY --from=openldap-installer /staging/etc/group /etc/group
-ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV PATH=/opt/zextras/common/bin:/opt/zextras/common/sbin:$PATH
-ENV LDAP_ROOT_PASSWORD=qh6hWZvc
-ENV LDAP_ADMIN_PASSWORD=password
-EXPOSE 1389
 
+COPY --from=openldap-installer \
+  /staging/usr/local/lib/ /usr/local/lib/
+
+# Esquemas generados durante la compilación
+COPY --from=build \
+  /build/src/ldap/generated/ \
+  /opt/zextras/common/etc/openldap/zimbra/
+
+# Scripts del proyecto
 COPY docker/openldap/ldap-utils/ /ldap-utils/
-COPY --from=build /build/src/ldap/generated/ /opt/zextras/common/etc/openldap/zimbra/
 
 COPY docker/openldap/entrypoint.sh /entrypoint.sh
 
-# [CAMBIO OPENSHIFT]: Configurar permisos para que cualquier UID aleatorio asignado por OpenShift
-# (que siempre pertenece al grupo GID 0 / root) pueda escribir en los directorios críticos de OpenLDAP.
-RUN chmod -R g=u /opt/zextras/common/etc/openldap \
-                 /var/lib/ldap \
-                 /var/run/openldap 2>/dev/null || true
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
-# [CAMBIO OPENSHIFT]: Declarar explícitamente la ejecución con un usuario no raíz (no-root). 
-# El UID 1001500000 es una buena práctica ya que cae dentro del rango por defecto de los SCC de OpenShift.
-USER 1001500000
+ENV PATH=/opt/zextras/common/bin:/opt/zextras/common/sbin:$PATH
+
+ENV LDAP_PORT=1389
+
+# Crear rutas requeridas
+RUN mkdir -p \
+      /opt/zextras/data/ldap/config \
+      /opt/zextras/data/ldap/mdb/db \
+      /opt/zextras/data/ldap/state/run \
+      /opt/zextras/conf/ca \
+      /opt/zextras/ldap/custom-ldifs \
+      /run/carbonio
+
+# Preparar permisos compatibles con OpenShift
+RUN chgrp -R 0 \
+      /opt/zextras/data \
+      /opt/zextras/conf \
+      /opt/zextras/ldap \
+      /run/carbonio \
+      /opt/zextras/common/etc/openldap && \
+    chmod -R g+rwX \
+      /opt/zextras/data \
+      /opt/zextras/conf \
+      /opt/zextras/ldap \
+      /run/carbonio \
+      /opt/zextras/common/etc/openldap
+
+# El script del fabricante utiliza chown en
+# la inicialización de los esquemas.
+# Retirar esa operación para ejecución sin root.
+RUN sed -i '/^[[:space:]]*chown zextras:zextras /d' \
+      /ldap-utils/zmldapschema
+
+# Evitar que el auxiliar imprima material
+# derivado de la contraseña de cn=config.
+RUN sed -i '/echo "base64 is /d' \
+      /ldap-utils/replace-olcRootPw
+
+RUN chmod 755 /entrypoint.sh && \
+    chmod 755 /ldap-utils/zmldapschema && \
+    chmod 755 /ldap-utils/replace-olcRootPw
+
+# Verificar que el binario existe.
+RUN test -x /opt/zextras/common/libexec/slapd
+
+# Puerto LDAP no privilegiado
+EXPOSE 1389/tcp
+
+# No fijar UID del namespace.
+# OpenShift podrá asignar uno permitido.
+USER 1001
 
 ENTRYPOINT ["/entrypoint.sh"]
